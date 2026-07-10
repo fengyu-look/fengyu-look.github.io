@@ -98,8 +98,17 @@ const els = {
   resetRecommendation: document.querySelector("#resetRecommendation"),
   profileForm: document.querySelector("#profileForm"),
   coverUpload: document.querySelector("#coverUpload"),
+  coverUploadInfo: document.querySelector("#coverUploadInfo"),
+  coverUploadProgress: document.querySelector("#coverUploadProgress"),
+  coverPreview: document.querySelector("#coverPreview"),
   avatarUpload: document.querySelector("#avatarUpload"),
+  avatarUploadInfo: document.querySelector("#avatarUploadInfo"),
+  avatarUploadProgress: document.querySelector("#avatarUploadProgress"),
+  avatarPreview: document.querySelector("#avatarPreview"),
   realPhotoUpload: document.querySelector("#realPhotoUpload"),
+  realPhotoUploadInfo: document.querySelector("#realPhotoUploadInfo"),
+  realPhotoUploadProgress: document.querySelector("#realPhotoUploadProgress"),
+  realPhotoPreview: document.querySelector("#realPhotoPreview"),
   dynamicFields: document.querySelector("#dynamicFields"),
   recommendationsView: document.querySelector("#recommendationsView"),
   profileView: document.querySelector("#profileView"),
@@ -109,6 +118,8 @@ let currentSession = null;
 let contentPages = [];
 let contentItems = [];
 const fallbackAdminEmails = new Set(["fengyuaimengyu@outlook.com"]);
+const MAX_UPLOAD_BYTES = 190 * 1024 * 1024;
+const objectUrls = new Set();
 
 function setStatus(message, isError = false) {
   els.statusLine.textContent = message;
@@ -121,6 +132,89 @@ function escapeHtml(value = "") {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function formatBytes(bytes = 0) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${(bytes / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+
+function uploadLabel(file) {
+  if (!file) return "未选择文件";
+  return `${file.name} · ${formatBytes(file.size)}`;
+}
+
+function assertUploadFile(file) {
+  if (!file) return;
+  if (file.size > MAX_UPLOAD_BYTES) {
+    throw new Error(`文件太大了：${formatBytes(file.size)}。当前存储桶单文件建议控制在 190 MB 以内。`);
+  }
+}
+
+function mediaElement(url, mime = "") {
+  const isVideo = mime.startsWith("video/") || /\.(mp4|webm)(\?|$)/i.test(url);
+  if (isVideo) return `<video src="${escapeHtml(url)}" muted playsinline controls preload="metadata"></video>`;
+  return `<img src="${escapeHtml(url)}" alt="">`;
+}
+
+function renderUploadPreview(preview, url, meta = {}) {
+  if (!preview || !url) return;
+  preview.hidden = false;
+  preview.innerHTML = `
+    ${mediaElement(url, meta.type || "")}
+    <div class="media-preview__meta">
+      <strong>${escapeHtml(meta.title || "当前预览")}</strong>
+      ${meta.detail ? `<span>${escapeHtml(meta.detail)}</span>` : ""}
+      <code>${escapeHtml(meta.url || url)}</code>
+    </div>
+  `;
+}
+
+function clearUploadPreview(preview, info) {
+  if (preview) {
+    preview.hidden = true;
+    preview.innerHTML = "";
+  }
+  if (info) info.textContent = "未选择文件";
+}
+
+function previewSelectedFile(file, preview, info, title) {
+  if (!file) return;
+  assertUploadFile(file);
+  const url = URL.createObjectURL(file);
+  objectUrls.add(url);
+  if (info) info.textContent = `${uploadLabel(file)} · 正在上传...`;
+  renderUploadPreview(preview, url, {
+    title,
+    detail: "本地预览，上传成功后会替换成公网地址。",
+    type: file.type,
+    url: file.name,
+  });
+}
+
+function updateUploadedFilePreview(url, file, preview, info, title) {
+  if (info) info.textContent = `${uploadLabel(file)} · 上传完成`;
+  renderUploadPreview(preview, url, {
+    title,
+    detail: "已上传到 Supabase Storage。",
+    type: file?.type || "",
+    url,
+  });
+}
+
+function renderUrlPreview(url, preview, title) {
+  const clean = String(url || "").trim();
+  if (!clean) {
+    clearUploadPreview(preview);
+    return;
+  }
+  renderUploadPreview(preview, clean, {
+    title,
+    detail: "当前 URL 预览。",
+    url: clean,
+  });
 }
 
 function parseJson(value, fallback) {
@@ -291,6 +385,8 @@ function resetRecommendationForm() {
   fillItemTypeSelect();
   renderDynamicFields({});
   els.recommendationForm.elements.data_json.value = "{}";
+  els.coverUpload.value = "";
+  clearUploadPreview(els.coverPreview, els.coverUploadInfo);
 }
 
 function fillPageForm() {
@@ -318,6 +414,13 @@ function editContentItem(item) {
   form.elements.is_published.checked = Boolean(item.is_published);
   renderDynamicFields(item.data || {});
   form.elements.data_json.value = JSON.stringify(item.data || {}, null, 2);
+  els.coverUpload.value = "";
+  if (item.cover_url) {
+    renderUrlPreview(item.cover_url, els.coverPreview, "当前封面");
+    els.coverUploadInfo.textContent = "正在使用已有封面 URL";
+  } else {
+    clearUploadPreview(els.coverPreview, els.coverUploadInfo);
+  }
   setStatus(`正在编辑：${item.title}`);
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
@@ -448,6 +551,8 @@ async function loadProfile() {
   form.elements.intro.value = data.intro ?? "";
   form.elements.contacts.value = JSON.stringify(data.contacts ?? [], null, 2);
   form.elements.social_links.value = JSON.stringify(data.social_links ?? [], null, 2);
+  renderUrlPreview(data.avatar_url, els.avatarPreview, "当前头像");
+  renderUrlPreview(data.real_photo_url, els.realPhotoPreview, "当前真人照片");
 }
 
 async function verifyAdmin(session) {
@@ -511,15 +616,83 @@ function showLogin() {
   els.sessionEmail.textContent = "未登录";
 }
 
-async function uploadToStorage(file, folder) {
+const UPLOAD_ERRORS = {
+  "Payload too large": "文件超过了存储桶的大小限制。",
+  "duplicate": "文件名已被占用，请稍后重试。",
+  "not found": "存储桶不存在，请检查配置。",
+  "Unauthorized": "上传权限不足，请重新登录后再试。",
+  "JWT": "登录已过期，请重新登录后再上传。",
+  "network": "网络连接失败，请检查网络后重试。",
+  "row-level security": "没有操作权限，请确认管理员身份。",
+};
+
+function translateUploadError(error) {
+  if (!error) return "未知错误，请重试。";
+  const msg = (error.message || String(error)).trim();
+  for (const [key, trans] of Object.entries(UPLOAD_ERRORS)) {
+    if (msg.toLowerCase().includes(key.toLowerCase())) return `❌ ${trans}`;
+  }
+  return `❌ 上传失败：${msg}`;
+}
+
+function showProgress(progressEl, percent) {
+  if (!progressEl) return;
+  progressEl.hidden = percent >= 100;
+  progressEl.value = percent;
+}
+
+function hideProgress(progressEl) {
+  if (!progressEl) return;
+  progressEl.hidden = true;
+  progressEl.value = 0;
+}
+
+async function uploadToStorage(file, folder, progressEl) {
   if (!file) return "";
+  showProgress(progressEl, 0);
   const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "-");
   const filePath = `admin-uploads/${folder}/${Date.now()}-${safeName}`;
-  const { error } = await supabase.storage.from("site-media").upload(filePath, file);
-  if (error) throw error;
+  const token = currentSession?.access_token || "";
 
-  const { data } = supabase.storage.from("site-media").getPublicUrl(filePath);
-  return data.publicUrl;
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent("site-media")}/${encodeURIComponent(filePath)}`);
+    xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    xhr.setRequestHeader("apikey", SUPABASE_ANON_KEY);
+
+    xhr.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable) {
+        showProgress(progressEl, Math.round((event.loaded / event.total) * 100));
+      }
+    });
+
+    xhr.addEventListener("load", () => {
+      hideProgress(progressEl);
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const publicUrl = `${SITE_MEDIA_BASE_URL}/${encodeURIComponent(filePath)}`;
+        resolve(publicUrl);
+      } else {
+        let errMsg = `上传失败 (${xhr.status})`;
+        try {
+          const body = JSON.parse(xhr.responseText);
+          errMsg = body.message || body.error || errMsg;
+        } catch (_) {}
+        reject(new Error(translateUploadError({ message: errMsg })));
+      }
+    });
+
+    xhr.addEventListener("error", () => {
+      hideProgress(progressEl);
+      reject(new Error(translateUploadError({ message: "network" })));
+    });
+
+    xhr.addEventListener("abort", () => {
+      hideProgress(progressEl);
+      reject(new Error("❌ 上传已取消。"));
+    });
+
+    xhr.send(file);
+  });
 }
 
 function switchView(view) {
@@ -602,10 +775,15 @@ els.coverUpload.addEventListener("change", async (event) => {
   if (!file) return;
   setStatus("正在上传封面...");
   try {
-    const url = await uploadToStorage(file, "covers");
+    previewSelectedFile(file, els.coverPreview, els.coverUploadInfo, "封面预览");
+    const url = await uploadToStorage(file, "covers", els.coverUploadProgress);
     els.recommendationForm.elements.cover_url.value = url;
+    updateUploadedFilePreview(url, file, els.coverPreview, els.coverUploadInfo, "封面预览");
     setStatus("封面上传完成。");
   } catch (error) {
+    event.currentTarget.value = "";
+    hideProgress(els.coverUploadProgress);
+    els.coverUploadInfo.textContent = error.message;
     setStatus(error.message, true);
   }
 });
@@ -615,9 +793,15 @@ els.avatarUpload.addEventListener("change", async (event) => {
   if (!file) return;
   setStatus("正在上传头像...");
   try {
-    els.profileForm.elements.avatar_url.value = await uploadToStorage(file, "profile");
+    previewSelectedFile(file, els.avatarPreview, els.avatarUploadInfo, "头像预览");
+    const url = await uploadToStorage(file, "profile", els.avatarUploadProgress);
+    els.profileForm.elements.avatar_url.value = url;
+    updateUploadedFilePreview(url, file, els.avatarPreview, els.avatarUploadInfo, "头像预览");
     setStatus("头像上传完成。");
   } catch (error) {
+    event.currentTarget.value = "";
+    hideProgress(els.avatarUploadProgress);
+    els.avatarUploadInfo.textContent = error.message;
     setStatus(error.message, true);
   }
 });
@@ -627,11 +811,34 @@ els.realPhotoUpload.addEventListener("change", async (event) => {
   if (!file) return;
   setStatus("正在上传真人照片...");
   try {
-    els.profileForm.elements.real_photo_url.value = await uploadToStorage(file, "profile");
+    previewSelectedFile(file, els.realPhotoPreview, els.realPhotoUploadInfo, "真人照片预览");
+    const url = await uploadToStorage(file, "profile", els.realPhotoUploadProgress);
+    els.profileForm.elements.real_photo_url.value = url;
+    updateUploadedFilePreview(url, file, els.realPhotoPreview, els.realPhotoUploadInfo, "真人照片预览");
     setStatus("真人照片上传完成。");
   } catch (error) {
+    event.currentTarget.value = "";
+    hideProgress(els.realPhotoUploadProgress);
+    els.realPhotoUploadInfo.textContent = error.message;
     setStatus(error.message, true);
   }
+});
+
+els.recommendationForm.elements.cover_url.addEventListener("input", (event) => {
+  renderUrlPreview(event.currentTarget.value, els.coverPreview, "封面 URL 预览");
+});
+
+els.profileForm.elements.avatar_url.addEventListener("input", (event) => {
+  renderUrlPreview(event.currentTarget.value, els.avatarPreview, "头像 URL 预览");
+});
+
+els.profileForm.elements.real_photo_url.addEventListener("input", (event) => {
+  renderUrlPreview(event.currentTarget.value, els.realPhotoPreview, "真人照片 URL 预览");
+});
+
+window.addEventListener("pagehide", () => {
+  objectUrls.forEach((url) => URL.revokeObjectURL(url));
+  objectUrls.clear();
 });
 
 els.recommendationForm.addEventListener("submit", async (event) => {
